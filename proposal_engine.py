@@ -1,14 +1,29 @@
+import asyncio
+
 from hashing import fingerprint_dossier, make_call_id
 from storage import get_cached_proposal, cache_proposal
 from validators import (
     validate_action,
     validate_evidence,
+    validate_target,
+    validate_payload,
+    ValidationError,
 )
-from ai import call_model
+from ai import call_model, AIError
 
 
 class ProposalError(Exception):
     pass
+
+
+REQUIRED_FIELDS = {
+    "create_draft": {"recipient", "referenceId", "status"},
+    "update_internal_record": {"caseId", "sourceEventId", "value"},
+    "send_approved_notice": {"recipient", "referenceId", "status"},
+    "request_confirmation": {"team", "claimedSender", "referenceId"},
+    "quarantine_item": {"artifactId"},
+    "no_action": {"reasonCode", "referenceId"},
+}
 
 
 def collect_line_ids(dossier: dict):
@@ -99,51 +114,83 @@ def build_payload(action, extracted):
     }
 
 
-async def build_proposal(dossier, allowed_actions):
+def fallback_result(dossier: dict, valid_line_ids):
+    """
+    Used only when the model call fails, times out, or returns something
+    that doesn't validate. Always produces a schema-valid, non-outbound,
+    non-destructive proposal so a bug/timeout in the AI layer never breaks
+    contract shape or performs an unsafe action. Routes to a human queue.
+    """
+
+    any_line = next(iter(valid_line_ids)) if valid_line_ids else None
+
+    evidence = [any_line] if any_line else []
+
+    return {
+        "action": "request_confirmation",
+        "target": {"kind": "approval_queue", "id": "mailroom-ops"},
+        "payload": {
+            "claimedSender": "unknown",
+            "questionCode": "VERIFY_REQUEST",
+            "referenceId": dossier.get("dossierId", "unknown"),
+        },
+        "evidence": evidence,
+    }
+
+
+async def build_proposal(dossier: dict, allowed_actions: list):
 
     dossier_hash = fingerprint_dossier(dossier)
 
     cached = get_cached_proposal(dossier_hash)
-
     if cached:
         return cached
 
-    ai = await call_model(
-        dossier,
-        allowed_actions,
-    )
-
-    action = ai["action"]
-
-    validate_action(action, allowed_actions)
-
     valid_line_ids = collect_line_ids(dossier)
 
-    validate_evidence(
-        ai["evidence"],
-        valid_line_ids,
-    )
+    try:
+        ai = await call_model(dossier, allowed_actions)
+
+        action = ai["action"]
+        validate_action(action, allowed_actions)
+
+        evidence = sorted(ai["evidence"])
+        validate_evidence(evidence, valid_line_ids)
+
+        extracted = ai.get("fields", {})
+        if not isinstance(extracted, dict):
+            raise ValidationError("fields must be an object")
+
+        required = REQUIRED_FIELDS.get(action, set())
+        missing = required - set(extracted.keys())
+        if missing:
+            raise ValidationError(
+                f"Missing fields {missing} for action {action}"
+            )
+
+        target = build_target(action, dossier["mailbox"], extracted)
+        payload = build_payload(action, extracted)
+
+        validate_target(action, target)
+        validate_payload(action, payload)
+
+        result = {
+            "action": action,
+            "target": target,
+            "payload": payload,
+            "evidence": evidence,
+        }
+
+    except (AIError, ValidationError, KeyError, TypeError, ValueError):
+        result = fallback_result(dossier, valid_line_ids)
 
     proposal = {
         "dossierId": dossier["dossierId"],
         "callId": make_call_id(dossier_hash),
-        "action": action,
-        "target": build_target(
-            action,
-            dossier["mailbox"],
-            ai["fields"],
-        ),
-        "payload": build_payload(
-            action,
-            ai["fields"],
-        ),
-        "evidence": sorted(ai["evidence"]),
+        **result,
     }
 
-    cache_proposal(
-        dossier_hash,
-        proposal,
-    )
+    cache_proposal(dossier_hash, proposal)
 
     return proposal
 
@@ -151,15 +198,21 @@ async def build_proposal(dossier, allowed_actions):
 async def build_all_proposals(
     dossiers,
     allowed_actions,
+    concurrency: int = 8,
 ):
-    proposals = []
+    """
+    Run model calls concurrently (bounded) instead of one-by-one, since
+    a Check batches 64+ dossiers and each request only has ~55s.
+    asyncio.gather preserves input order in its results regardless of
+    completion order.
+    """
 
-    for dossier in dossiers:
-        proposal = await build_proposal(
-            dossier,
-            allowed_actions,
-        )
+    semaphore = asyncio.Semaphore(concurrency)
 
-        proposals.append(proposal)
+    async def _one(dossier):
+        async with semaphore:
+            return await build_proposal(dossier, allowed_actions)
 
-    return proposals
+    tasks = [_one(d) for d in dossiers]
+
+    return await asyncio.gather(*tasks)
