@@ -1,6 +1,5 @@
 import hashlib
 import json
-import base64
 from typing import Any
 
 
@@ -23,15 +22,34 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _to_plain(value: Any) -> Any:
+    """
+    Recursively convert Pydantic models (or lists/dicts containing them)
+    into plain JSON-safe data. A list of Pydantic models does NOT itself
+    have .model_dump(), only its items do -- this is the bug we're fixing.
+    """
+
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+
+    if isinstance(value, list):
+        return [_to_plain(v) for v in value]
+
+    if isinstance(value, dict):
+        return {k: _to_plain(v) for k, v in value.items()}
+
+    return value
+
+
 def compute_input_digest(dossiers) -> str:
     """
     SHA256 of canonical dossiers JSON.
+
+    `dossiers` may be a single Pydantic model, a list of Pydantic models,
+    a list of plain dicts, or a plain dict -- all are normalized first.
     """
 
-    if hasattr(dossiers, "model_dump"):
-        payload = dossiers.model_dump(mode="json")
-    else:
-        payload = dossiers
+    payload = _to_plain(dossiers)
 
     canonical = canonical_json(payload)
 
@@ -81,10 +99,7 @@ def fingerprint_dossier(dossier) -> str:
     Used for cache key.
     """
 
-    if hasattr(dossier, "model_dump"):
-        payload = dossier.model_dump(mode="json")
-    else:
-        payload = dossier
+    payload = _to_plain(dossier)
 
     canonical = canonical_json(payload)
 
